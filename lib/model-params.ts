@@ -10,6 +10,8 @@
  *      (override the path with LEMONADE_PARAMS_FILE). OPTIONAL: a missing
  *      file simply means no user entries. Lives on the host volume like
  *      settings.json; gitignored in the config repo. Recognized models
+ *      (bundled examples) are seeded here ON DEMAND, one model at a time,
+ *      when first actually used (seedModelEntry) — never bulk-preloaded.
  *   2. Plugin tier — lib/model-params.json (next to this file). Shipped
  *      with the plugin, versioned with the stack; seeds the models the
  *      stack actually runs.
@@ -230,7 +232,8 @@ export function readUserParams(): ModelParamsFile | undefined {
 
 /**
  * Safe single-key upsert for the user tier — the ONLY sanctioned write
- * path for the user params file. Shared by `/lemonade tune`.
+ * path for the user params file. Shared by first-use seeding
+ * (seedModelEntry) and `/lemonade tune`. The user file is user-owned data
  * (hand-tuned entries), so the contract is: this call may ADD or REPLACE
  * one key and may CREATE a missing file — it may never destroy the file.
  *
@@ -283,6 +286,66 @@ export function upsertUserParamsEntry(
 }
 
 /**
+ * Targeted first-use seed for the user tier (replaces the 2026-09-08
+ * bulk bootstrap, which preloaded the ENTIRE example catalog — only
+ * models the user actually runs should be preconfigured).
+ *
+ * `seedModelEntry(modelId)` — for ONE wire model id:
+ *   - already in the user OR plugin tier → "present", nothing written.
+ *   - recognized in bundled examples/model-params.example.json → that
+ *     SINGLE entry is merged into the user file and "seeded". Other
+ *     entries are never modified; a missing file is created; a CORRUPT
+ *     file is never clobbered ("unknown" + warning) — the write goes
+ *     through upsertUserParamsEntry, the single sanctioned write path.
+ *   - not recognized anywhere → "unknown", NO file written. The model
+ *     keeps sane defaults — recipe-keyword reasoning detection in model
+ *     sync, plain pi pass-through for tuning. To tune it properly, probe
+ *     the running server with `/lemonade tune <id>` (writes a sourced
+ *     entry) or add it to the user file manually.
+ *
+ * Guarded by the LEMONADE_PAYLOAD_TUNING master switch (tuning off → no
+ * config writes). Writes are atomic (tmp + rename) and best-effort: a
+ * failure never breaks a request.
+ *
+ * @returns "seeded" when the entry was added, "present" when already
+ *          catalogued, "unknown" when nothing was done.
+ */
+export function seedModelEntry(modelId: string): "seeded" | "present" | "unknown" {
+  if (!modelId) return "unknown";
+  const v = (process.env.LEMONADE_PAYLOAD_TUNING ?? "").trim().toLowerCase();
+  if (v === "0" || v === "off" || v === "false" || v === "no") return "unknown";
+  if (readPluginParams()?.[modelId] || readUserParams()?.[modelId]) return "present";
+  const example = readExampleEntry(modelId);
+  if (!example) return "unknown";
+  const result = upsertUserParamsEntry(modelId, example);
+  if (result === "written") {
+    console.log(
+      `[lemonade] seeded ${modelId} into user model params ${userParamsPath()} (from bundled examples)`,
+    );
+    return "seeded";
+  }
+  return "unknown"; // abort-corrupt / error — already warned by upsert
+}
+
+const exampleCache: FileCache = {};
+
+/** Read one entry from the bundled examples file (curated reference tier). */
+function readExampleEntry(modelId: string): ModelParamsEntry | undefined {
+  const file = path.join(__dirname, "..", "examples", "model-params.example.json");
+  try {
+    const st = fs.statSync(file);
+    let data = exampleCache.current?.data;
+    if (!data || exampleCache.current.mtimeMs !== st.mtimeMs) {
+      data = JSON.parse(fs.readFileSync(file, "utf8")) as ModelParamsFile;
+      exampleCache.current = { mtimeMs: st.mtimeMs, data };
+    }
+    return data?.[modelId];
+  } catch {
+    return undefined; // no bundled example available
+  }
+}
+
+/**
  * Merge plugin (base) + user (override) entries for one wire model id.
  * Section-level, then field-level merge. Returns undefined when the id is
  * in neither tier — that is the "default pi behavior" pass-through signal.
@@ -291,7 +354,22 @@ export function resolveModelEntry(modelId: string): ModelParamsEntry | undefined
   if (!modelId) return undefined;
   const base = readPluginParams()?.[modelId];
   const over = readUserParams()?.[modelId];
-  if (!base && !over) return undefined;
+  if (base || over) return mergeEntries(base, over);
+  // Cold-start fallback: the bundled reference tier is NOT a live catalog
+  // (file membership in user/plugin tiers is the tuning gate), but it does
+  // know the CAPABILITY FLAGS for recognized models. A pi process that
+  // registered the provider before this model was seeded maps it with
+  // reasoning=false — which clamps the session thinking level to "off"
+  // until the next restart (the 2026-09-10 Qwen3.8 symptom). Resolving the
+  // example entry here lets a post-registration re-register see the correct
+  // capabilities without writing anything.
+  return readExampleEntry(modelId);
+}
+
+function mergeEntries(
+  base: ModelParamsEntry | undefined,
+  over: ModelParamsEntry | undefined,
+): ModelParamsEntry {
 
   const merge = <T extends Record<string, unknown>>(a?: T, b?: T): T | undefined => {
     const m = { ...a, ...b };
@@ -329,4 +407,15 @@ export function resolveModelEntry(modelId: string): ModelParamsEntry | undefined
 export function thinkingRow(entry: ModelParamsEntry): SamplingParams | undefined {
   if (samplingProfile() === "coding" && entry.coding) return { ...entry.thinking, ...entry.coding };
   return entry.thinking;
+}
+
+/**
+ * True when the model has a live catalog entry (user or plugin tier). The
+ * bundled examples tier is NOT live — it only backs resolveModelEntry's
+ * cold-start capability fallback. Used by the extension to decide whether a
+ * re-registration actually changes pi's in-memory model view.
+ */
+export function isCatalogued(modelId: string): boolean {
+  if (!modelId) return false;
+  return Boolean(readPluginParams()?.[modelId] || readUserParams()?.[modelId]);
 }

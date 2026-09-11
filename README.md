@@ -78,11 +78,21 @@ no parameter injection).
 Two tiers, merged per model id (user tier wins field-by-field):
 
 1. **User tier** — `~/.pi/agent/model-params.json` (override the path with
-   `LEMONADE_PARAMS_FILE`). Optional; create it with `/lemonade tune <id>`.
+   `LEMONADE_PARAMS_FILE`). Optional. Recognized models (present in
+   [`examples/model-params.example.json`](examples/model-params.example.json))
+   are seeded here **on first use, one model at a time** — the model of the
+   request is the only reliable "current model" signal, so seeding follows
+   what you actually run, never a bulk preload. Other models are created
+   with `/lemonade tune <id>` (probes the running server) or by hand.
+   Unknown models (neither tier) keep sane defaults: recipe-keyword
+   reasoning detection in model sync, plain pi pass-through for tuning —
+   nothing is invented.
 2. **Plugin tier** — `lib/model-params.json` in this package (empty by
 design — shipped entries live in
    [`examples/model-params.example.json`](examples/model-params.example.json)
-   for reference).
+   for reference). A first-use seed also refreshes `models-store.json`
+   (debounced) so the seeded model's reasoning flag — and therefore its
+   available thinking levels — apply without a pi restart.
 
 `/lemonade tune <id>` writes only what it sourced or proved: probe results
 for `reasoning`/`vision`, and the checkpoint's embedded
