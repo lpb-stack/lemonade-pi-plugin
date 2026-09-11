@@ -12,7 +12,7 @@ import path from "node:path";
 import type { LemonadeModelInfo } from "./types.js";
 import { fetchModels } from "./http.js";
 import { buildBaseUrl } from "./url-helpers.js";
-import { mapToProviderModel } from "./models.js";
+import { isPiVisible, mapToProviderModel } from "./models.js";
 
 const STORE_PATH = path.join(os.homedir(), ".pi", "agent", "models-store.json");
 
@@ -47,7 +47,9 @@ export async function syncModelStore(baseUrl: string, apiKey?: string): Promise<
     const data = await res.json() as { data?: LemonadeModelInfo[] };
     const models = data?.data || [];
 
-    const mapped = models.map((m) => mapToProviderModel(m));
+    // Same pi-compatibility filter as provider registration, so the store
+    // and the picker always agree.
+    const mapped = models.filter(isPiVisible).map((m) => mapToProviderModel(m));
 
     try {
       const existing = JSON.parse(

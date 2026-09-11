@@ -72,6 +72,9 @@ export async function fetchModels(baseUrl: string, apiKey?: string): Promise<Lem
         config: m.config && typeof m.config === "object"
           ? m.config as Record<string, unknown>
           : undefined,
+        // Checkpoint pointer ("<hf-repo>:<file>") — /lemonade tune uses it to
+        // fetch the checkpoint's embedded GGUF sampling metadata.
+        checkpoint: typeof m.checkpoint === "string" ? m.checkpoint : undefined,
         recipe_options: m.recipe_options && typeof m.recipe_options === "object"
           ? m.recipe_options as LemonadeModelInfo["recipe_options"]
           : undefined,
