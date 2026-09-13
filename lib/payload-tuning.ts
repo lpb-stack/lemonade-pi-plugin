@@ -38,6 +38,23 @@
  *          0 reasoning in 7/7 runs). Models whose backend exposes no
  *          wire off simply keep the server's default behavior.
  *
+ *   preserveThinking (P6) — per-model switch for echoing the model's own
+ *          prior thinking back in assistant history. `false` strips ALL
+ *          reasoning fields (reasoning_content / reasoning /
+ *          reasoning_text) from prior assistant messages on every request.
+ *          Required for Qwen3.8-generation templates, which preserve
+ *          prior thinking ON BY DEFAULT and — via the template's
+ *          last-segment clause — still feed back the assistant turn that
+ *          precedes a tool result even when a per-request
+ *          chat_template_kwargs {"preserve_thinking": false} is sent.
+ *          That last-segment echo is exactly the shape of every pi
+ *          tool-loop call and caused the 2026-09-13 interview loop bug
+ *          (repeated replies + repeated tool calls per user answer).
+ *          Full rationale + the deferred surgical variant (S2) live in
+ *          ModelParamsEntry.preserveThinking (lib/model-params.ts).
+ *          Absent / true → pi default (echo stays); the strip is a
+ *          no-op for non-reasoning models (no fields to remove).
+ *
  * Env (read at request time; defaults are correct for this stack):
  *   LEMONADE_PAYLOAD_TUNING=off     master switch — disable ALL tuning
  *   LEMONADE_SAMPLING_PROFILE=coding select the coding thinking row (default: general)
@@ -75,6 +92,41 @@ export function thinkingBudgetLevel(level: string | undefined): "minimal" | "low
   const l = level.toLowerCase();
   if (l === "xhigh" || l === "max") return "high";
   return l === "minimal" || l === "low" || l === "medium" || l === "high" ? l : undefined;
+}
+
+/**
+ * Reasoning fields pi may attach to assistant messages (see pi's
+ * OPENAI_COMPLETIONS_REASONING_FIELDS). Only these are ever removed —
+ * `reasoning_details` (signed, opencode-go) is left untouched.
+ */
+const ASSISTANT_REASONING_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+
+/**
+ * P6: return a copy of `messages` with the prior-thinking echo fields
+ * removed from assistant messages, or undefined when nothing needs
+ * stripping. The input array and its message objects are NEVER mutated
+ * (stripped messages are replaced by shallow copies). Reasoning fields
+ * are the only fields ever removed — `reasoning_details` (signed,
+ * opencode-go) is left untouched.
+ *
+ * Rationale and the deferred surgical variant (S2: kwarg
+ * {"preserve_thinking": false} + strip only the last assistant segment)
+ * are documented on ModelParamsEntry.preserveThinking.
+ */
+export function stripAssistantReasoning(messages: unknown): unknown[] | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  let stripped = false;
+  const out = messages.map((msg) => {
+    if (!msg || typeof msg !== "object" || (msg as { role?: unknown }).role !== "assistant") return msg;
+    const m = msg as Record<string, unknown>;
+    const hits = ASSISTANT_REASONING_FIELDS.filter((f) => f in m);
+    if (hits.length === 0) return msg;
+    stripped = true;
+    const copy: Record<string, unknown> = { ...m };
+    for (const f of hits) delete copy[f];
+    return copy;
+  });
+  return stripped ? out : undefined;
 }
 
 /**
@@ -129,6 +181,20 @@ export function tuneModelPayload(
 
   const out: Record<string, unknown> = { ...payload };
   let changed = false;
+
+  // ── P6: per-model prior-thinking echo switch (catalog preserveThinking).
+  //    Independent of the thinking-ON/OFF branch below: pi attaches the
+  //    echo fields on prior assistant messages even at the off level, and
+  //    the template renders them regardless of the current request's
+  //    thinking fields. `false` → strip (full, all assistant messages);
+  //    absent/true → untouched (pi default). See ModelParamsEntry docs.
+  if (entry.preserveThinking === false) {
+    const stripped = stripAssistantReasoning(out.messages);
+    if (stripped) {
+      out.messages = stripped;
+      changed = true;
+    }
+  }
 
   // Thinking ON iff pi sent a budget field or an effort. (off → neither,
   // so the server's `--reasoning on` default would run unbounded thinking.)

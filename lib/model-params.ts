@@ -37,7 +37,8 @@
  *     "coding":      { "temperature": 0.6 },
  *     "nonThinking": { "temperature": 0.7, "top_p": 0.8, "top_k": 20,
  *                      "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0 },
- *     "offParams":   { "enable_thinking": false }
+ *     "offParams":   { "enable_thinking": false },
+ *     "preserveThinking": false
  *   }
  * }
  *
@@ -168,6 +169,53 @@ export interface ModelParamsEntry {
    * If absent, pi's effort value is sent unchanged.
    */
   effortMap?: EffortMap;
+  /**
+   * Feed the model's own prior thinking back into the conversation
+   * (assistant-history `reasoning_content`). ALL OR NOTHING per model:
+   *   - absent / true  → pi's default: thinking is echoed back on every
+   *     prior assistant message (`reasoning_content`).
+   *   - false          → strip ALL reasoning fields from prior assistant
+   *     messages on every wire request (see payload-tuning.ts for the
+   *     full rationale + the deferred surgical variant).
+   *
+   * WHY IT EXISTS (added 2026-09-13, Qwen3.8-27B-GGUF loop bug):
+   * The Qwen3.8-generation chat template ships with thinking preservation
+   * ON BY DEFAULT (`preserve_thinking is undefined or ... is true`), unlike
+   * Qwen3/3.5/3.6 (default false). pi echoes thinking back on every
+   * assistant message, and the template's last-segment clause
+   * (`loop.index0 > ns.last_query_index`) preserves the assistant turn
+   * that directly precedes a tool result EVEN when a per-request
+   * `chat_template_kwargs {"preserve_thinking": false}` is sent — which is
+   * exactly the shape of every pi tool-loop call. Verified 2026-09-13 via
+   * hidden-instruction probes against the running llama.cpp backend:
+   * with the echo on, the model obeyed instructions buried in its own
+   * prior thinking. Consequence observed in /memory-interview: the model's
+   * thinking contains the full draft reply, the draft is fed back on the
+   * next tool-loop call, and the 27B model re-emitted the same reply +
+   * the same memory-save tool call 3-5x per answer ("empty" assistant
+   * bubbles, duplicated questions, a hallucinated empty user message).
+   * Stripping is the version-proof fix: it is a client-side history edit,
+   * independent of template version, backend flags, or per-request kwarg
+   * support (which is being deprecated in llama.cpp ≥ b8322).
+   * It is a NO-OP for non-reasoning models (pi never attaches the fields
+   * when no thinking was produced) and for templates that ignore the
+   * fields — so it only ever changes behavior for models that actually
+   * render prior reasoning.
+   * Side benefit: prior thinking tokens are no longer re-sent on every
+   * call (real context savings on local NPU serving).
+   *
+   * DEFERRED VARIANT (S2) if thinking continuity is ever wanted back:
+   * send `chat_template_kwargs {"preserve_thinking": false}` AND strip the
+   * reasoning fields only from the LAST assistant segment (the turns after
+   * the last user query — the only ones the template feeds back when the
+   * kwarg is off). That matches the pre-Qwen3.8 vendor default exactly and
+   * fixes the tool-loop pattern with minimal deviation from the Qwen3.8
+   * template intent. Not implemented: the full strip is simpler, and the
+   * continuity benefit was never validated on these models — revisit only
+   * with a benchmark (thinking-bench) showing the full strip regresses
+   * quality.
+   */
+  preserveThinking?: boolean;
 }
 
 export type ModelParamsFile = Record<string, ModelParamsEntry>;
@@ -400,6 +448,9 @@ function mergeEntries(
   // effortMap: user tier can add entries; absent → plugin tier maps it
   const effortMap = merge(base?.effortMap, over?.effortMap);
   if (effortMap) merged.effortMap = effortMap;
+  // preserveThinking: user tier wins (absent stays absent — pi default)
+  const preserveThinking = over?.preserveThinking ?? base?.preserveThinking;
+  if (typeof preserveThinking === "boolean") merged.preserveThinking = preserveThinking;
   return merged;
 }
 

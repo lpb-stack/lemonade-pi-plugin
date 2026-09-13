@@ -22,6 +22,7 @@ import {
   applySampling,
   envFlag,
   MIN_ANSWER_TOKENS,
+  stripAssistantReasoning,
   thinkingBudgetLevel,
   tuneModelPayload,
 } from "../lib/payload-tuning.js";
@@ -147,6 +148,115 @@ delete process.env.LEMONADE_SAMPLING_PROFILE;
   check("LEMONADE_PAYLOAD_TUNING=off: untouched", r2 === undefined);
   check("LEMONADE_PAYLOAD_TUNING on: tuned (control)", r !== undefined);
   check("input payload not mutated", JSON.stringify(p) === JSON.stringify(before));
+}
+
+// ── P6: preserveThinking — strip prior-thinking echo from assistant history ──
+{
+  // Tool-loop wire shape: [developer, user, assistant(thinking + toolCall), tool]
+  const toolLoopMessages = () => [
+    { role: "developer", content: "You are an expert coding assistant." },
+    { role: "user", content: "yes, you can call me SP" },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "Got it, SP. 2. What timezone are you in?",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "memory", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "c1", content: "ok" },
+    { role: "assistant", content: "earlier reply", reasoning_content: "old thinking" },
+  ];
+
+  // Flag OFF → strip every reasoning field on assistant messages only
+  writeUserFile({
+    "Qwen3.8-27B-GGUF": { reasoning: true, preserveThinking: false },
+  });
+  {
+    const p = wirePayload({ messages: toolLoopMessages(), thinking_budget_tokens: 8192, reasoning_effort: "medium" });
+    const before = deepCopy(p);
+    const r = tuneModelPayload(p);
+    check("P6 off: payload rewritten", r !== undefined);
+    const msgs = r?.messages as Array<Record<string, unknown>>;
+    const assistants = msgs.filter((m) => m.role === "assistant");
+    check("P6 off: no reasoning fields left on assistants",
+      assistants.every((m) => !("reasoning_content" in m) && !("reasoning" in m) && !("reasoning_text" in m)),
+      assistants);
+    check("P6 off: assistant content + tool_calls preserved",
+      assistants[0]?.content === null && Array.isArray(assistants[0]?.tool_calls) && assistants[1]?.content === "earlier reply",
+      assistants);
+    const nonAssistants = msgs.filter((m) => m.role !== "assistant");
+    check("P6 off: non-assistant messages untouched",
+      nonAssistants.some((m) => m.role === "tool") && JSON.stringify(msgs.filter((m) => m.role === "user")) === JSON.stringify(before.messages.filter((m) => m.role === "user")),
+      nonAssistants);
+    check("P6 off: input payload not mutated", JSON.stringify(p) === JSON.stringify(before));
+    check("P6 off: tuning still applied (budget untouched by strip)", typeof r?.thinking_budget_tokens === "number");
+  }
+  // Works at the off level too (pi still echoes reasoning fields there)
+  {
+    const p = wirePayload({ messages: toolLoopMessages(), enable_thinking: false });
+    const r = tuneModelPayload(p);
+    const msgs = (r?.messages ?? []) as Array<Record<string, unknown>>;
+    check("P6 off level: strip applies without thinking fields",
+      r !== undefined && msgs.filter((m) => m.role === "assistant").every((m) => !("reasoning_content" in m)),
+      r);
+  }
+
+  // Flag ABSENT → pi default: echo fields pass through untouched
+  writeUserFile({
+    "Qwen3.8-27B-GGUF": { reasoning: true },
+  });
+  {
+    const p = wirePayload({ messages: toolLoopMessages(), thinking_budget_tokens: 8192, reasoning_effort: "medium" });
+    const r = tuneModelPayload(p);
+    const msgs = (r?.messages ?? p.messages) as Array<Record<string, unknown>>;
+    const assistants = msgs.filter((m) => m.role === "assistant");
+    check("P6 absent: reasoning_content preserved (pi default)",
+      assistants.length === 2 && assistants.every((m) => typeof m.reasoning_content === "string"), assistants);
+  }
+  // Flag TRUE → explicitly keep the echo
+  writeUserFile({
+    "Qwen3.8-27B-GGUF": { reasoning: true, preserveThinking: true },
+  });
+  {
+    const p = wirePayload({ messages: toolLoopMessages(), thinking_budget_tokens: 8192, reasoning_effort: "medium" });
+    const before = deepCopy(p);
+    const r = tuneModelPayload(p);
+    // preserveThinking:true with no other tunables → nothing changes →
+    // undefined (pass-through) means the echo fields survive untouched.
+    const msgs = (r?.messages ?? p.messages) as Array<Record<string, unknown>>;
+    check("P6 true: reasoning_content preserved (pass-through untouched)",
+      r === undefined && JSON.stringify(p) === JSON.stringify(before)
+        && msgs.filter((m) => m.role === "assistant").every((m) => typeof m.reasoning_content === "string"),
+      r);
+  }
+
+  // Unit: the helper itself (returns a new array; never mutates input)
+  check("stripAssistantReasoning: non-array → undefined", stripAssistantReasoning("x") === undefined);
+  {
+    const input = [{ role: "assistant", content: null, reasoning_content: "t", reasoning: "r", reasoning_text: "x" }];
+    const before = deepCopy(input);
+    const out = stripAssistantReasoning(input);
+    check("stripAssistantReasoning: new array, all three fields removed",
+      out !== undefined && out !== (input as unknown) && Array.isArray(out)
+        && !("reasoning_content" in out[0]) && !("reasoning" in out[0]) && !("reasoning_text" in out[0]) && (out[0] as object).content === null,
+      out);
+    check("stripAssistantReasoning: input not mutated", JSON.stringify(input) === JSON.stringify(before));
+  }
+  {
+    const msgs = [{ role: "user", content: "hi", reasoning_content: "should stay (not assistant)" }];
+    check("stripAssistantReasoning: non-assistant untouched → undefined", stripAssistantReasoning(msgs) === undefined);
+  }
+
+  // Restore the seeded catalog for the sections below
+  writeUserFile({
+    "Qwen3.8-27B-GGUF": {
+      reasoning: true, vision: true, maxTokens: 16384,
+      budgets: { minimal: 2048, low: 3072, medium: 8192, high: 16384 },
+      thinking: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0 },
+      coding: { temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repetition_penalty: 1.0 },
+      nonThinking: { temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0 },
+      offParams: { enable_thinking: false },
+    },
+  });
 }
 
 // ── P2: per-level budgets from the catalog ─────────────────────────────────
